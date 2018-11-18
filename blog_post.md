@@ -78,6 +78,22 @@ iex(alex@localhost)5> flush()
 :ok
 ```
 
+#### A Note On Communicating Between Nodes on Different Networks
+If you want to send messages between nodes on different networks, we need to start the named nodes with a shared cookie:
+
+
+```bash
+iex --sname alex@localhost --cookie secret_token
+```
+
+```bash
+iex --sname kate@localhost --cookie secret_token
+```
+
+Only nodes started with the same `cookie` will be able to successfully connect to one another.
+
+#### `Node.spawn_link` Limitations
+
 While `Node.spawn_link` illustrates the relationships between nodes and the manner in which we can send messages between them, its _not_ really the right choice for an application that will run across distributed nodes. `Node.spawn_link` spawns processes in isolation, i.e. processes that are not supervised. If only there was a way to spawn supervised, asynchronous processes _across nodes_...
 
 ## Distributed Tasks
@@ -270,4 +286,136 @@ We can see that the `alex` node recieved the response, `"chicken?"`. If we open 
 
 ```elixir
 iex(moebi@localhost)1> hi
+```
+
+## Testing Distributed Code
+
+Let's start by writing a simple test for our `send_message` function.
+
+```elixir
+# test/chat_test.ex
+defmodule ChatTest do
+  use ExUnit.Case, async: true
+  doctest Chat
+
+  test "send_message" do
+    assert Chat.send_message(:moebi@localhost, "hi") == :ok
+  end
+end
+```
+
+If we run our tests via `mix test`, we see:
+
+
+This error makes perfect sense--we can't connect to a node named `moebi@localhost` because there is no such node running.
+
+We can get this test passing by performing a few steps:
+
+* Open another terminal window and run the named node: `iex --sname moebi@localhost -S mix`
+* Run the tests in the first terminal via a named node that runs the mix tests in an `iex` session: `iex --sname sophie@localhost -S mix test`
+
+This is a lot of work and definitely wouldn't be considered an automated testing process.
+
+There are a two different approaches we could take here. We can conditionally exclude tests that need distributed nodes, if the necessary node is not running.
+
+Another option is to configure out application to avoid spawning tasks on remote nodes in the test environment.
+
+Let's take a look at the first approach.
+
+### Conditionally Excluding Tests with Tags
+
+We'll add an `ExUnit` tag to this test:
+
+```elixir
+```
+
+And we'll add some conditional logic to our test helper to exclude tests with such tags if the tests are _not_ running on a named node.
+
+```elixir
+#test/chat_test.ex
+defmodule ChatTest do
+  use ExUnit.Case, async: true
+  doctest Chat
+
+  @tag :distributed
+  test "send_message" do
+    assert Chat.send_message(:moebi@localhost, "hi") == :ok
+  end
+end
+```
+
+```elixir
+exclude =
+  if Node.alive?, do: [], else: [distributed: true]
+
+ExUnit.start(exclude: exclude)
+```
+
+We check to see if the node is alive, i.e. if the node is part of a distributed system with [`Node.alive?`](https://hexdocs.pm/elixir/Node.html#alive?/0). If not, we can tell `ExUnit` to skip any tests with the `distributed: true` tag. Otherwise, we will tell it not to exclude any tests.
+
+Now, if we run plain old `mix test`, we'll see:
+
+```bash
+mix test
+Excluding tags: [distributed: true]
+
+Finished in 0.02 seconds
+1 test, 0 failures, 1 excluded
+```
+
+And if we want to run our distributed tests, we simply need to go through the steps outlined in the previous section: run the `moebi@localhost` node _and_ run the tests in a named node via `iex`.
+
+Let's take a look at our other testing approach--building a mock.
+
+### Mocking Task Spawning
+
+The part of our code that tells `Task.Supervisor` to start a supervised task on a remote node is here:
+
+```elixir
+# app/chat.ex
+def spawn_task(module, fun, recipient, args) do
+  Task.Supervisor.async(remote_supervisor(recipient), module, fun, args)
+  |> Task.await
+end
+
+defp remote_supervisor(recipient) do
+  {Chat.TaskSupervisor, recipient}
+end
+```
+
+`Task.Supervisor.async` takes in a first argument of the supervisor we want to use. If we pass in a tuple of `{SupervisorName, location}`, it will start up the given supervisor on the given remote node. However, if we pass `Task.Supervisor` a first argument of a supervisor name along, it will use that supervisor to supervise the task locally.
+
+Let's make the `remote_supervisor` function configurable based on environment. In the development environment, it will return `{Chat.TaskSupervisor, recipient}` and in the test environment it will return `Chat.TaskSupervisor`.
+
+We'll do this via application variables.
+
+Create a file, `config/dev.exs`, and add:
+
+```elixir
+# config/dev.exs
+use Mix.Config
+config :chat, remote_supervisor: fn(recipient) -> {Chat.TaskSupervisor, recipient} end
+```
+
+Create a file, `config/test.exs` and add:
+
+```elixir
+# config/test.exs
+use Mix.Config
+config :chat, remote_supervisor: fn(_recipient) -> Chat.TaskSupervisor end
+```
+
+Remember to uncomment this line in `config/config.exs`:
+
+```elixir
+import_config "#{Mix.env()}.exs"
+```
+
+Lastly, we'll update our `Chat.remote_supervisor` function to look up and use the function stored in our new application variable:
+
+```elixir
+# lib/chat.ex
+defp remote_supervisor(recipient) do
+  Application.get_env(:chat, :remote_supervisor).(recipient)
+end
 ```
